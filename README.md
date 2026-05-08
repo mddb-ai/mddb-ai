@@ -12,8 +12,7 @@ Because this approach leans entirely on AI inference, MDDB-AI’s memory organiz
 The Goal: To enable AI to autonomously structure, store, and accurately recall information within a file system, turning a static repository into a living, evolving memory bank.
 
 Note on Implementation:
-The philosophy behind MDDB-AI is currently more advanced than its implementation. I am focusing on proving the concept first. If you have any insights or suggestions on how to make the code as robust as the vision, I would deeply appreciate your feedback and contributions.
-
+The philosophy behind MDDB-AI is currently more advanced than its implementation. To be honest, I built this because I needed it for my own use. Since I’m building it at high speed through "Vibe Coding," there are many rough edges and areas for improvement. I am focusing on proving the concept first. I would deeply appreciate any contributions or insights to help make the code as robust as the vision.
 
 # Flowchart
 
