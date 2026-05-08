@@ -61,12 +61,15 @@ def init(
     ``mddbai palace init`` separately.
     """
 
+    from mddbai.brain import agent_guide as _agent_guide  # noqa: PLC0415
     from mddbai.cli import integration as _intg  # noqa: PLC0415
 
     data_dir.mkdir(parents=True, exist_ok=True)
     with _open(data_dir):
         pass
+    guide_path = _agent_guide.ensure(data_dir)
     typer.echo(f"initialized: {data_dir}")
+    typer.echo(f"  guide: {guide_path}")
 
     root = (project_root or data_dir.resolve().parent).resolve()
     root.mkdir(parents=True, exist_ok=True)
