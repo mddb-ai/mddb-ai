@@ -162,7 +162,8 @@ def register_python_hooks_in_settings(
         )
         return settings_path, "created"
 
-    raw = settings_path.read_text(encoding="utf-8")
+    # utf-8-sig: tolerate BOM produced by Windows editors / PowerShell Set-Content.
+    raw = settings_path.read_text(encoding="utf-8-sig")
     try:
         loaded = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -238,7 +239,7 @@ def uninstall_claude_full(
 
     if settings_path.exists():
         try:
-            loaded = json.loads(settings_path.read_text(encoding="utf-8"))
+            loaded = json.loads(settings_path.read_text(encoding="utf-8-sig"))
         except json.JSONDecodeError:
             loaded = None
         if isinstance(loaded, dict):
@@ -317,7 +318,7 @@ def claude_full_status(project_root: Path) -> dict[str, object]:
     in_settings: dict[str, bool] = {}
     if settings_path.exists():
         try:
-            loaded = json.loads(settings_path.read_text(encoding="utf-8"))
+            loaded = json.loads(settings_path.read_text(encoding="utf-8-sig"))
         except json.JSONDecodeError:
             loaded = None
         for event, filename in _PY_HOOK_EVENTS:
