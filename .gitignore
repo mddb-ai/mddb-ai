@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.hypothesis/
+
+# Builds
+build/
+dist/
+*.whl
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# MDDB dogfood — this repo's dev choice (user projects decide for themselves)
+.mddbai/
+mddb.toml.local
+
+# Local configs (project rules stay tracked)
+.claude/settings.local.json

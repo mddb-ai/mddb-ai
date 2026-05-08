@@ -1,0 +1,99 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mddbai"
+version = "0.1.0"
+description = "MDDB — Markdown-native memory database filesystem that AI reads and writes directly"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+authors = [{ name = "MDDB Contributors" }]
+keywords = ["markdown", "ai", "memory", "memory-palace", "drawer", "navigation", "llm", "agents"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+]
+dependencies = [
+    "pyyaml>=6.0",
+    "xxhash>=3.4",
+    "numpy>=1.26",
+    "pydantic>=2.6",
+    "typer>=0.12",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "sortedcontainers>=2.4",
+]
+
+[project.optional-dependencies]
+security = [
+    "cryptography>=42.0",
+]
+http = [
+    "httpx>=0.27",
+]
+dev = [
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "types-PyYAML",
+]
+
+[project.scripts]
+mddbai = "mddbai.cli.main:main"
+
+[project.urls]
+Homepage = "https://github.com/mddb-ai/mddb-ai"
+Repository = "https://github.com/mddb-ai/mddb-ai"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mddbai"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/mddbai", "README.md", "LICENSE", "CHANGELOG.md"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",          # pycodestyle / pyflakes
+    "I",                    # isort
+    "B",                    # bugbear
+    "UP",                   # pyupgrade
+    "SIM",                  # simplify
+    "RUF",                  # ruff specific
+    "PL",                   # pylint
+    "TCH",                  # type checking imports
+    "PTH",                  # pathlib
+]
+ignore = [
+    "E501",     # line too long (formatter handles)
+    "PLR0913",  # too many args
+    "PLR2004",  # magic value
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+warn_unused_ignores = true
+show_error_codes = true
+mypy_path = "src"
+packages = ["mddbai"]
+
+[[tool.mypy.overrides]]
+module = ["xxhash", "yaml", "sortedcontainers", "uvicorn"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+markers = [
+    "gate: mddbai gate-critical tests (run via `pytest -m gate` in pre-commit / CI). Blocks regressions in strict retrieval, recall-check, write/read placement assist, and doctor --gate.",
+]
+
