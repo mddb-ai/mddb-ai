@@ -38,3 +38,6 @@ mddb.toml.local
 
 # Local configs (project rules stay tracked)
 .claude/settings.local.json
+
+# Maintainer-only build scripts (live in private dev repo)
+scripts/
