@@ -710,8 +710,10 @@ def cues_cmd(
             # cold AI — dump every shelf. ls table folders from disk.
             tables: list[str] = []
             if data_dir.exists():
+                from mddbai.engine import _is_skippable_dir_name  # noqa: PLC0415
+
                 for p in data_dir.iterdir():
-                    if p.is_dir() and not p.name.startswith("_"):
+                    if p.is_dir() and not _is_skippable_dir_name(p.name):
                         tables.append(p.name)
             tables.sort()
             all_cues: dict[str, list[dict[str, object]]] = {}
@@ -2684,10 +2686,12 @@ def _write_call1_map(
     # Existing folders (tables)
     typer.echo("## existing folders (tables)")
     _SYSTEM_PREFIXES = {"_wal", "_brain", "_self"}
+    from mddbai.engine import _is_skippable_dir_name  # noqa: PLC0415
+
     tables: list[Path] = []
     if data_dir.exists():
         for p in sorted(data_dir.iterdir()):
-            if p.is_dir() and not p.name.startswith("_") and p.name not in _SYSTEM_PREFIXES:
+            if p.is_dir() and not _is_skippable_dir_name(p.name) and p.name not in _SYSTEM_PREFIXES:
                 tables.append(p)
     if not tables:
         typer.echo("(none — first entry)")
@@ -2974,11 +2978,14 @@ def write_cmd(  # noqa: PLR0912, PLR0915
     ),
     max_routes: int = typer.Option(5, "--max-routes"),
 ) -> None:
-    """Placement-assist write — 3-call flow.
+    """Placement-assist write — 3-call flow (or 1-call auto with --yes).
 
-    Call 1 (map): no destination option -> print palace + folder list + cue candidate drawers.
+    Call 1 (map, dry-run): no destination, no --yes -> print palace + folder list + cue candidate drawers.
     Call 2 (location): destination option but no --yes -> location review + format guide.
     Call 3 (save): --yes -> actual save + recall-check (weak/miss also saved, stderr warning only).
+
+    Auto placement: --yes alone (no destination options) -> save at the recommended
+    location derived from --kind / --cue / --entity. First-write friendly.
 
     All output is Markdown (R4 / D1 aligned).
     """
@@ -3072,8 +3079,10 @@ def write_cmd(  # noqa: PLR0912, PLR0915
         or new_section
     )
 
-    # ---- Call 1: dump map (no destination) ----------------------------
-    if not has_destination:
+    # ---- Call 1: dump map (no destination, dry-run) -------------------
+    # `--yes` without a destination falls through to recommendation
+    # (auto-placement) — first-write friendly. Without `--yes`, dump map.
+    if not has_destination and not yes:
         _write_call1_map(
             data_dir,
             cues=cues,

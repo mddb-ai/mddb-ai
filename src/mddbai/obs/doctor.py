@@ -739,9 +739,9 @@ def _check_english_naming(db: Database, report: DoctorReport) -> None:
     seen: set[Path] = set()
     for entry in root.rglob("*"):
         rel_parts = entry.relative_to(root).parts
-        if any(part.startswith("_") for part in rel_parts):
+        if any(part.startswith("_") or part.startswith(".") for part in rel_parts):
             continue
-        if entry.is_file() and entry.name.startswith("_"):
+        if entry.is_file() and (entry.name.startswith("_") or entry.name.startswith(".")):
             continue
         if entry.is_file() and (
             entry.name.endswith(".lock")

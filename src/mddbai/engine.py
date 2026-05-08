@@ -30,6 +30,16 @@ from .core.logging import get_logger
 from .core.types import TableName
 
 
+def _is_skippable_dir_name(name: str) -> bool:
+    """Skip system folders (underscore prefix) and hidden ones (dot prefix).
+
+    Dot-prefix folders include user environment artifacts (.venv, .git, .idea,
+    .pytest_cache, .ruff_cache) that should never be treated as data tables.
+    """
+
+    return name.startswith("_") or name.startswith(".")
+
+
 class Database:
     """Drawer-only Database. Concurrency: single process, multiple threads, serialized via ``_lock``."""
 
@@ -155,7 +165,7 @@ class Database:
 
         names: set[str] = set()
         for entry in self._dir.iterdir():
-            if entry.is_dir() and not entry.name.startswith("_"):
+            if entry.is_dir() and not _is_skippable_dir_name(entry.name):
                 names.add(entry.name)
         return sorted(TableName(n) for n in names)
 
@@ -821,7 +831,7 @@ class Database:
                 return
             for ent in sorted(entries, key=lambda e: e.name):
                 name = ent.name
-                if name.startswith("_"):
+                if _is_skippable_dir_name(name):
                     continue
                 if ent.is_file() and name.endswith(".md"):
                     rel = "/".join(parts_so_far + [name[:-3]])
@@ -912,7 +922,7 @@ class Database:
                 return
             for ent in entries:
                 name = ent.name
-                if name.startswith("_"):
+                if _is_skippable_dir_name(name):
                     continue
                 if ent.is_file():
                     if not name.endswith(".md"):
