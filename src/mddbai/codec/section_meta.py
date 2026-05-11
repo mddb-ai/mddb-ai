@@ -109,6 +109,18 @@ VALID_MEMORY_ZONES = ("hot", "warm", "cold", "archive")
 VALID_STATES = ("active", "superseded", "deprecated")
 VALID_SOURCES = ("ai", "user", "cite", "tool", "import")
 
+# Typed relation kinds (2026-05-09).
+# AI assigns the kind at write time. DB only validates the label and stores it.
+# D2 alignment: meaning of "refines" vs "implies" is the AI's call.
+VALID_RELATION_KINDS = (
+    "refines",
+    "supersedes",
+    "contradicts",
+    "implies",
+    "depends-on",
+    "derived-from",
+)
+
 # Language code validation — 2-8 lowercase letters, one hyphen allowed (en-us etc.).
 # No strict whitelist — D2 alignment, AI / user free decision.
 _LANG_PATTERN = re.compile(r"^[a-z]{2,3}(-[a-z]{2,4})?$")
@@ -142,6 +154,24 @@ class SectionMetadataError(MddbError):
 
 
 @dataclass(slots=True)
+class Relation:
+    """Typed relation edge to another section/drawer (2026-05-09).
+
+    Coexists with the legacy untyped ``related`` list. Use ``related`` for
+    plain adjacency (no semantic kind), use ``relations`` when the AI wants
+    to mark the *kind* of relationship (refines / supersedes / contradicts
+    / implies / depends-on / derived-from). DB validates ``kind`` against
+    VALID_RELATION_KINDS only — meaning is the AI's call (D2).
+    """
+
+    target: str
+    kind: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"target": self.target, "kind": self.kind}
+
+
+@dataclass(slots=True)
 class SectionMetadata:
     """Navigation metadata for one H2 section. All optional — when present, contributes to navigate score.
 
@@ -169,6 +199,13 @@ class SectionMetadata:
     cue: list[str] = field(default_factory=list)
     importance: float | None = None
     related: list[str] = field(default_factory=list)
+    relations: list[Relation] = field(default_factory=list)
+    """Typed relation edges (2026-05-09).
+
+    Coexists with ``related``. Used when the AI wants to mark the *kind*
+    of relationship instead of bare adjacency. AI decides the kind, DB
+    only validates the label (D1/D2 alignment).
+    """
     memory_zone: str | None = None
     entity: list[str] = field(default_factory=list)
     date: str | None = None
@@ -233,6 +270,8 @@ class SectionMetadata:
             out["importance"] = float(self.importance)
         if self.related:
             out["related"] = list(self.related)
+        if self.relations:
+            out["relations"] = [r.to_dict() for r in self.relations]
         if self.memory_zone is not None:
             out["memory_zone"] = self.memory_zone
         if self.entity:
@@ -264,6 +303,7 @@ class SectionMetadata:
             cue=list(self.cue) if self.cue else list(other.cue),
             importance=self.importance if self.importance is not None else other.importance,
             related=list(self.related) if self.related else list(other.related),
+            relations=list(self.relations) if self.relations else list(other.relations),
             memory_zone=self.memory_zone if self.memory_zone is not None else other.memory_zone,
             entity=list(self.entity) if self.entity else list(other.entity),
             date=self.date if self.date is not None else other.date,
@@ -329,6 +369,9 @@ def parse_section_metadata(raw: Any) -> SectionMetadata:
 
     related_raw = raw.get("related", [])
     related = _coerce_str_list(related_raw, "related")
+
+    relations_raw = raw.get("relations", [])
+    relations = _coerce_relation_list(relations_raw)
 
     zone_raw = raw.get("memory_zone")
     if zone_raw is None or zone_raw == "":
@@ -446,6 +489,7 @@ def parse_section_metadata(raw: Any) -> SectionMetadata:
         cue=cue,
         importance=importance,
         related=related,
+        relations=relations,
         memory_zone=memory_zone,
         entity=entity,
         date=date,
@@ -458,6 +502,46 @@ def parse_section_metadata(raw: Any) -> SectionMetadata:
         chosen_because=chosen_because,
         lang=lang,
     )
+
+
+def _coerce_relation_list(value: Any) -> list[Relation]:
+    """Parse the ``relations`` field into a list of Relation objects.
+
+    Each entry must be a mapping with ``target`` (non-empty string) and
+    ``kind`` (one of VALID_RELATION_KINDS). Invalid entries raise
+    SectionMetadataError. None / empty list returns [].
+    """
+
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise SectionMetadataError(
+            f"relations must be a list, got {type(value).__name__}"
+        )
+    out: list[Relation] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise SectionMetadataError(
+                f"relations entries must be mappings, got {type(item).__name__}"
+            )
+        target = item.get("target")
+        kind = item.get("kind")
+        if not isinstance(target, str) or not target.strip():
+            raise SectionMetadataError(
+                f"relations entry missing non-empty 'target' string"
+            )
+        if not isinstance(kind, str) or not kind.strip():
+            raise SectionMetadataError(
+                f"relations entry missing non-empty 'kind' string"
+            )
+        kind_norm = kind.strip()
+        if kind_norm not in VALID_RELATION_KINDS:
+            raise SectionMetadataError(
+                f"relations.kind must be one of {VALID_RELATION_KINDS}, "
+                f"got {kind_norm!r}"
+            )
+        out.append(Relation(target=target.strip(), kind=kind_norm))
+    return out
 
 
 def _coerce_str_list(value: Any, name: str) -> list[str]:
@@ -604,6 +688,8 @@ def derive_structural_cue(
 
 __all__ = [
     "VALID_MEMORY_ZONES",
+    "VALID_RELATION_KINDS",
+    "Relation",
     "SectionMetadata",
     "SectionMetadataError",
     "derive_structural_cue",

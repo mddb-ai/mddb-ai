@@ -41,6 +41,13 @@ class RelatedRef:
     target: str  # Destination drawer (``<table>/<drawer>``)
     section_id: str | None = None  # Origin section ID for section-level links
     exists: bool = False  # Whether the drawer actually exists
+    kind: str | None = None
+    """Typed relation kind (2026-05-09).
+
+    None for legacy untyped ``related`` entries. Set to one of
+    VALID_RELATION_KINDS for entries read from ``relations``. AI consumes
+    the kind to choose how to traverse — DB does not interpret it.
+    """
 
 
 @dataclass(slots=True)
@@ -76,18 +83,29 @@ def _drawer_path_for(data_dir: Path, normalized_ref: str) -> Path:
     return data_dir / f"{normalized_ref}.md"
 
 
-def _read_related_keys(path: Path) -> tuple[list[str], dict[str, list[str]]]:
+def _read_related_keys(
+    path: Path,
+) -> tuple[
+    list[str],
+    dict[str, list[str]],
+    dict[str, list[tuple[str, str]]],
+]:
     """Extract drawer-level + section-level related keys from a drawer .md.
 
     Returns:
-        ``(drawer_level_related, section_level_map)``.
+        ``(drawer_level_related, section_level_related, section_level_typed)``.
+
+        - drawer_level_related: untyped legacy ``related`` at drawer frontmatter.
+        - section_level_related: untyped legacy ``related`` per section.
+        - section_level_typed: typed ``relations`` per section as
+          ``[(target, kind), ...]`` (2026-05-09).
     """
 
     try:
         text = path.read_text(encoding="utf-8")
         meta, _ = fm_parse(text)
     except (OSError, ValueError):
-        return [], {}
+        return [], {}, {}
     drawer_related: list[str] = []
     raw = meta.get("related")
     if isinstance(raw, list):
@@ -95,6 +113,7 @@ def _read_related_keys(path: Path) -> tuple[list[str], dict[str, list[str]]]:
     elif isinstance(raw, str) and raw.strip():
         drawer_related = [raw.strip()]
     section_map: dict[str, list[str]] = {}
+    typed_map: dict[str, list[tuple[str, str]]] = {}
     try:
         sections_meta = parse_sections_meta(meta)
     except Exception:  # noqa: BLE001
@@ -102,7 +121,9 @@ def _read_related_keys(path: Path) -> tuple[list[str], dict[str, list[str]]]:
     for sid, sm in sections_meta.items():
         if sm.related:
             section_map[sid] = list(sm.related)
-    return drawer_related, section_map
+        if sm.relations:
+            typed_map[sid] = [(r.target, r.kind) for r in sm.relations]
+    return drawer_related, section_map, typed_map
 
 
 def collect_related_refs(
@@ -115,7 +136,7 @@ def collect_related_refs(
     src_path = _drawer_path_for(data_dir, src)
     if not src_path.exists():
         return []
-    drawer_related, section_map = _read_related_keys(src_path)
+    drawer_related, section_map, typed_map = _read_related_keys(src_path)
     out: list[RelatedRef] = []
     for ref in drawer_related:
         target = _normalize_ref(data_dir, table, ref)
@@ -140,6 +161,20 @@ def collect_related_refs(
                     target=target,
                     section_id=sid,
                     exists=_drawer_path_for(data_dir, target).exists(),
+                )
+            )
+    for sid, typed_refs in typed_map.items():
+        for ref, kind in typed_refs:
+            target = _normalize_ref(data_dir, table, ref)
+            if target is None:
+                continue
+            out.append(
+                RelatedRef(
+                    source=src,
+                    target=target,
+                    section_id=sid,
+                    exists=_drawer_path_for(data_dir, target).exists(),
+                    kind=kind,
                 )
             )
     return out

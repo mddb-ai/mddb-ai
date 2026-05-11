@@ -421,6 +421,7 @@ class Database:
         cue: list[str] | None = None,
         importance: float | None = None,
         related: list[str] | None = None,
+        relations: list[dict[str, str]] | None = None,
         memory_zone: str | None = None,
         entity: list[str] | None = None,
         date: str | None = None,
@@ -452,7 +453,10 @@ class Database:
         """
 
         from mddbai.codec.section_meta import (  # noqa: PLC0415
+            Relation,
             SectionMetadata,
+            SectionMetadataError,
+            VALID_RELATION_KINDS,
             parse_sections_meta,
             serialize_sections_meta,
             validate_section_id,
@@ -461,10 +465,33 @@ class Database:
         validate_section_id(section_id)
         path = self._drawer_path(table, drawer)
 
+        relations_objs: list[Relation] = []
+        if relations:
+            for entry in relations:
+                if not isinstance(entry, dict):
+                    raise SectionMetadataError(
+                        f"relations entry must be a mapping, got {type(entry).__name__}"
+                    )
+                target = entry.get("target")
+                kind = entry.get("kind")
+                if not isinstance(target, str) or not target.strip():
+                    raise SectionMetadataError(
+                        "relations entry missing non-empty 'target'"
+                    )
+                if not isinstance(kind, str) or kind.strip() not in VALID_RELATION_KINDS:
+                    raise SectionMetadataError(
+                        f"relations.kind must be one of {VALID_RELATION_KINDS}, "
+                        f"got {kind!r}"
+                    )
+                relations_objs.append(
+                    Relation(target=target.strip(), kind=kind.strip())
+                )
+
         new_meta = SectionMetadata(
             cue=list(cue) if cue else [],
             importance=importance,
             related=list(related) if related else [],
+            relations=relations_objs,
             memory_zone=memory_zone,
             entity=list(entity) if entity else [],
             date=date,
@@ -508,6 +535,7 @@ class Database:
             "cue": list(merged_meta.cue),
             "importance": merged_meta.importance,
             "related": list(merged_meta.related),
+            "relations": [r.to_dict() for r in merged_meta.relations],
             "memory_zone": merged_meta.memory_zone,
             "entity": list(merged_meta.entity),
             "date": merged_meta.date,
@@ -547,6 +575,7 @@ class Database:
             "cue": list(sm.cue),
             "importance": sm.importance,
             "related": list(sm.related),
+            "relations": [r.to_dict() for r in sm.relations],
             "memory_zone": sm.memory_zone,
             "entity": list(sm.entity),
             "date": sm.date,

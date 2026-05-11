@@ -1263,18 +1263,32 @@ def link_cmd(
         "--bidir/--unidir",
         help="Bidirectional (default). --unidir means A -> B only.",
     ),
+    kind: str | None = typer.Option(
+        None,
+        "--kind",
+        help=(
+            "Typed relation kind (2026-05-09). When set, writes to the "
+            "``relations`` field instead of plain ``related``. One of: "
+            "refines, supersedes, contradicts, implies, depends-on, "
+            "derived-from. AI decides the kind, DB only validates."
+        ),
+    ),
 ) -> None:
     """Relationship Linking — write a related edge between A and B (meta frontmatter).
 
     Step 5 of the multi-stage write protocol (4.2). No separate knowledge-graph
-    search engine — only updates ``sections_meta[<sid>].related`` in markdown
+    search engine — only updates ``sections_meta[<sid>].related`` (untyped) or
+    ``sections_meta[<sid>].relations`` (typed, when --kind is set) in markdown
     frontmatter.
 
     Examples::
 
         mddbai link .mddbai notes/diary#monday notes/diary#tuesday
         mddbai link .mddbai decisions/v1#lock decisions/dogma#d1 --unidir
+        mddbai link .mddbai decisions/v2#lock decisions/v1#lock --kind supersedes
     """
+
+    from mddbai.codec.section_meta import VALID_RELATION_KINDS  # noqa: PLC0415
 
     def _parse(ref: str) -> tuple[str, str, str]:
         if "#" not in ref:
@@ -1289,6 +1303,11 @@ def link_cmd(
         table, drawer = head.split("/", 1)
         return table, drawer, sid
 
+    if kind is not None and kind not in VALID_RELATION_KINDS:
+        raise typer.BadParameter(
+            f"--kind must be one of {VALID_RELATION_KINDS}, got {kind!r}"
+        )
+
     a_t, a_d, a_s = _parse(a)
     b_t, b_d, b_s = _parse(b)
 
@@ -1298,21 +1317,459 @@ def link_cmd(
     with _open(data_dir) as db:
         # A -> B
         existing_a = db.get_section_meta(a_t, a_d, a_s) or {}
-        a_related = list(existing_a.get("related") or [])
-        if b_target not in a_related:
-            a_related.append(b_target)
-        db.put_section_meta(a_t, a_d, a_s, related=a_related, merge=True)
+        if kind is None:
+            a_related = list(existing_a.get("related") or [])
+            if b_target not in a_related:
+                a_related.append(b_target)
+            db.put_section_meta(a_t, a_d, a_s, related=a_related, merge=True)
+        else:
+            a_relations = list(existing_a.get("relations") or [])
+            if not any(
+                r.get("target") == b_target and r.get("kind") == kind
+                for r in a_relations
+            ):
+                a_relations.append({"target": b_target, "kind": kind})
+            db.put_section_meta(a_t, a_d, a_s, relations=a_relations, merge=True)
 
         if bidir:
             existing_b = db.get_section_meta(b_t, b_d, b_s) or {}
-            b_related = list(existing_b.get("related") or [])
-            if a_target not in b_related:
-                b_related.append(a_target)
-            db.put_section_meta(b_t, b_d, b_s, related=b_related, merge=True)
+            if kind is None:
+                b_related = list(existing_b.get("related") or [])
+                if a_target not in b_related:
+                    b_related.append(a_target)
+                db.put_section_meta(b_t, b_d, b_s, related=b_related, merge=True)
+            else:
+                b_relations = list(existing_b.get("relations") or [])
+                if not any(
+                    r.get("target") == a_target and r.get("kind") == kind
+                    for r in b_relations
+                ):
+                    b_relations.append({"target": a_target, "kind": kind})
+                db.put_section_meta(b_t, b_d, b_s, relations=b_relations, merge=True)
 
+    suffix = f" [{kind}]" if kind else ""
     typer.echo(
-        f"- linked: {a_target} {'<->' if bidir else '->'} {b_target}"
+        f"- linked: {a_target} {'<->' if bidir else '->'} {b_target}{suffix}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 2026-05-09 reasoning primitives: conflict-check / compare / provenance / mutations
+#
+# These commands give the AI more raw signal to reason with at recall time.
+# DB does not interpret meaning (D2) — it only collects signals from on-disk
+# state and emits them. The AI judges what to do.
+# ---------------------------------------------------------------------------
+
+
+def _parse_section_ref(ref: str) -> tuple[str, str, str]:
+    """``<table>/<drawer>#<section>`` -> (table, drawer, section). Raises typer.BadParameter."""
+
+    if "#" not in ref:
+        raise typer.BadParameter(
+            f"reference must be <table>/<drawer>#<section>, got {ref!r}"
+        )
+    head, sid = ref.rsplit("#", 1)
+    if "/" not in head:
+        raise typer.BadParameter(
+            f"reference must include table/drawer before '#', got {ref!r}"
+        )
+    table, drawer = head.split("/", 1)
+    return table, drawer, sid
+
+
+@app.command("conflict-check")
+def conflict_check_cmd(
+    data_dir: Path,
+    ref: str = typer.Argument(
+        ..., help="Section to check: <table>/<drawer>#<section>"
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Emit JSON."),
+) -> None:
+    """Conflict signals for one section (2026-05-09).
+
+    Inspects the section's metadata + outgoing edges and reports:
+
+    - ``contradicts``: this section has a relations[kind=contradicts] edge.
+    - ``mixed-kind``: this section has both refines and contradicts edges
+      pointing to the same target (semantic mismatch).
+    - ``stale-active``: this section's state=active, but another section
+      points at it via relations[kind=supersedes] (something newer claims
+      to replace it, yet it is still active).
+    - ``state-mismatch``: this section's related/relations target has
+      state=superseded or deprecated, but this section is active.
+    - ``cycle-supersedes``: cycle detected when walking outgoing
+      kind=supersedes edges back to this section.
+
+    Returns rc 0 when no signals found, rc 1 when signals found.
+    DB does not decide the meaning of these signals — the AI judges.
+    """
+
+    import json as _json  # noqa: PLC0415
+
+    t, d, s = _parse_section_ref(ref)
+    self_target = f"{t}/{d}#{s}"
+
+    signals: list[dict[str, Any]] = []
+
+    with _open(data_dir) as db:
+        meta = db.get_section_meta(t, d, s)
+        if meta is None:
+            typer.echo(f"# error: section not found: {ref}", err=True)
+            raise typer.Exit(2)
+
+        relations = list(meta.get("relations") or [])
+        related = list(meta.get("related") or [])
+        my_state = meta.get("state")
+
+        # Signal 1: direct contradicts edges.
+        for r in relations:
+            if r.get("kind") == "contradicts":
+                signals.append({
+                    "kind": "contradicts",
+                    "target": r.get("target"),
+                    "note": "this section explicitly contradicts target",
+                })
+
+        # Signal 2: mixed-kind edges to the same target.
+        kinds_by_target: dict[str, set[str]] = {}
+        for r in relations:
+            tgt = r.get("target")
+            k = r.get("kind")
+            if not tgt or not k:
+                continue
+            kinds_by_target.setdefault(tgt, set()).add(k)
+        for tgt, kinds in kinds_by_target.items():
+            if "contradicts" in kinds and (kinds & {"refines", "implies", "depends-on"}):
+                signals.append({
+                    "kind": "mixed-kind",
+                    "target": tgt,
+                    "note": f"both contradicts and {sorted(kinds - {'contradicts'})} on same target",
+                })
+
+        # Signal 3: state-mismatch — outgoing edges land on superseded/deprecated.
+        all_targets: list[tuple[str, str | None]] = []
+        for x in related:
+            all_targets.append((str(x), None))
+        for r in relations:
+            if r.get("target"):
+                all_targets.append((str(r["target"]), r.get("kind")))
+        for tgt, k in all_targets:
+            if "#" not in tgt:
+                continue
+            head, ref_sid = tgt.rsplit("#", 1)
+            if "/" not in head:
+                continue
+            ref_t, ref_d = head.split("/", 1)
+            try:
+                ref_meta = db.get_section_meta(ref_t, ref_d, ref_sid) or {}
+            except Exception:  # noqa: BLE001
+                ref_meta = {}
+            ref_state = ref_meta.get("state")
+            if ref_state in ("superseded", "deprecated") and my_state == "active":
+                signals.append({
+                    "kind": "state-mismatch",
+                    "target": tgt,
+                    "edge_kind": k,
+                    "target_state": ref_state,
+                    "note": f"active section points at {ref_state} target",
+                })
+
+        # Signal 4: stale-active — someone else marks this as superseded.
+        if my_state == "active":
+            try:
+                tables = [str(name) for name in db.tables()]
+            except Exception:  # noqa: BLE001
+                tables = []
+            data_root = Path(db.config.data_dir)
+            for tname in tables:
+                table_root = data_root / tname
+                if not table_root.exists():
+                    continue
+                for path in table_root.rglob("*.md"):
+                    if any(p.startswith("_") for p in path.relative_to(table_root).parts):
+                        continue
+                    if path.name.endswith((".lock", ".tmp")):
+                        continue
+                    try:
+                        text = path.read_text(encoding="utf-8")
+                    except OSError:
+                        continue
+                    if "supersedes" not in text and self_target not in text:
+                        # Cheap pre-filter — file does not even mention us.
+                        continue
+                    rel = path.relative_to(table_root).as_posix()
+                    if rel.endswith(".md"):
+                        rel = rel[:-3]
+                    other_meta_full = db.drawer_engine.cache.get_meta(path)
+                    if not other_meta_full:
+                        continue
+                    try:
+                        from mddbai.codec.section_meta import parse_sections_meta  # noqa: PLC0415
+                        other_sections = parse_sections_meta(dict(other_meta_full))
+                    except Exception:  # noqa: BLE001
+                        continue
+                    for o_sid, o_sm in other_sections.items():
+                        for o_rel in o_sm.relations:
+                            if o_rel.kind == "supersedes" and o_rel.target == self_target:
+                                signals.append({
+                                    "kind": "stale-active",
+                                    "claimed_by": f"{tname}/{rel}#{o_sid}",
+                                    "note": "another section says it supersedes us, but we are still active",
+                                })
+
+        # Signal 5: cycle-supersedes — outgoing supersedes chain returns to self.
+        seen: set[str] = {self_target}
+        frontier: list[str] = []
+        for r in relations:
+            if r.get("kind") == "supersedes" and r.get("target"):
+                frontier.append(str(r["target"]))
+        while frontier:
+            cur = frontier.pop()
+            if cur == self_target:
+                signals.append({
+                    "kind": "cycle-supersedes",
+                    "via": list(seen),
+                    "note": "supersedes chain cycles back to this section",
+                })
+                break
+            if cur in seen or "#" not in cur:
+                continue
+            seen.add(cur)
+            head, c_sid = cur.rsplit("#", 1)
+            if "/" not in head:
+                continue
+            c_t, c_d = head.split("/", 1)
+            try:
+                cur_meta = db.get_section_meta(c_t, c_d, c_sid) or {}
+            except Exception:  # noqa: BLE001
+                cur_meta = {}
+            for r in cur_meta.get("relations") or []:
+                if r.get("kind") == "supersedes" and r.get("target"):
+                    frontier.append(str(r["target"]))
+
+    if json_out:
+        typer.echo(_json.dumps({"section": self_target, "signals": signals}, ensure_ascii=False, indent=2))
+    else:
+        if not signals:
+            typer.echo(f"- {self_target}: no conflict signals")
+        else:
+            typer.echo(f"- {self_target}: {len(signals)} signal(s)")
+            for s in signals:
+                head = f"  [{s['kind']}]"
+                rest = " ".join(
+                    f"{k}={v}" for k, v in s.items() if k != "kind"
+                )
+                typer.echo(f"{head} {rest}")
+
+    if signals:
+        raise typer.Exit(1)
+
+
+@app.command("compare")
+def compare_cmd(
+    data_dir: Path,
+    a: str = typer.Argument(..., help="A: <table>/<drawer>#<section>"),
+    b: str = typer.Argument(..., help="B: <table>/<drawer>#<section>"),
+    body_only: bool = typer.Option(
+        True,
+        "--body-only/--with-heading",
+        help="Strip the heading line from each side before comparing (default).",
+    ),
+) -> None:
+    """Compare two sections — emit common / a-only / b-only line sets.
+
+    No semantic conclusion (D2). The AI reads the marked sets and judges
+    what they mean. Output format::
+
+        ## common
+        line shared by both
+        ## a-only
+        line only in A
+        ## b-only
+        line only in B
+    """
+
+    a_t, a_d, a_s = _parse_section_ref(a)
+    b_t, b_d, b_s = _parse_section_ref(b)
+
+    with _open(data_dir) as db:
+        a_text = db.take_section(a_t, a_d, a_s, body_only=body_only)
+        b_text = db.take_section(b_t, b_d, b_s, body_only=body_only)
+
+    if a_text is None:
+        typer.echo(f"# error: A not found: {a}", err=True)
+        raise typer.Exit(2)
+    if b_text is None:
+        typer.echo(f"# error: B not found: {b}", err=True)
+        raise typer.Exit(2)
+
+    a_lines = [ln.rstrip() for ln in a_text.splitlines() if ln.strip()]
+    b_lines = [ln.rstrip() for ln in b_text.splitlines() if ln.strip()]
+    a_set = set(a_lines)
+    b_set = set(b_lines)
+
+    common = [ln for ln in a_lines if ln in b_set]
+    a_only = [ln for ln in a_lines if ln not in b_set]
+    b_only = [ln for ln in b_lines if ln not in a_set]
+
+    typer.echo("## common")
+    if not common:
+        typer.echo("(none)")
+    for ln in common:
+        typer.echo(ln)
+    typer.echo("")
+    typer.echo("## a-only")
+    if not a_only:
+        typer.echo("(none)")
+    for ln in a_only:
+        typer.echo(ln)
+    typer.echo("")
+    typer.echo("## b-only")
+    if not b_only:
+        typer.echo("(none)")
+    for ln in b_only:
+        typer.echo(ln)
+
+
+@app.command("provenance")
+def provenance_cmd(
+    data_dir: Path,
+    ref: str = typer.Argument(
+        ..., help="Section: <table>/<drawer>#<section>"
+    ),
+    max_depth: int = typer.Option(
+        5, "--max-depth", help="Maximum hops to walk back (cycle-safe)."
+    ),
+    kinds: str = typer.Option(
+        "supersedes,refines,derived-from",
+        "--kinds",
+        help="Comma-separated relation kinds to follow back. Default covers ancestry kinds.",
+    ),
+) -> None:
+    """Walk *outgoing* edges of the given kinds to surface ancestors.
+
+    For section X, follows X's relations[kind in {supersedes,refines,derived-from}]
+    transitively to expose where X comes from. Cycle-safe.
+
+    AI uses this to trace why a decision is what it is. DB does not decide
+    which ancestor "matters" (D2).
+    """
+
+    follow_kinds = {k.strip() for k in kinds.split(",") if k.strip()}
+    if not follow_kinds:
+        raise typer.BadParameter("--kinds must list at least one kind")
+
+    t, d, s = _parse_section_ref(ref)
+    start = f"{t}/{d}#{s}"
+
+    chain: list[dict[str, Any]] = []
+    visited: set[str] = {start}
+
+    with _open(data_dir) as db:
+        frontier: list[tuple[str, int, str | None]] = [(start, 0, None)]
+        while frontier:
+            cur, depth, via_kind = frontier.pop(0)
+            if depth > max_depth:
+                continue
+            if cur != start:
+                chain.append({
+                    "ancestor": cur,
+                    "depth": depth,
+                    "via_kind": via_kind,
+                })
+            if "#" not in cur:
+                continue
+            head, c_sid = cur.rsplit("#", 1)
+            if "/" not in head:
+                continue
+            c_t, c_d = head.split("/", 1)
+            try:
+                cur_meta = db.get_section_meta(c_t, c_d, c_sid) or {}
+            except Exception:  # noqa: BLE001
+                cur_meta = {}
+            for r in cur_meta.get("relations") or []:
+                k = r.get("kind")
+                tgt = r.get("target")
+                if not tgt or k not in follow_kinds:
+                    continue
+                if tgt in visited:
+                    continue
+                visited.add(str(tgt))
+                frontier.append((str(tgt), depth + 1, k))
+
+    typer.echo(f"- start: {start}")
+    if not chain:
+        typer.echo("  (no ancestors via " + ",".join(sorted(follow_kinds)) + ")")
+    for entry in chain:
+        typer.echo(
+            f"  depth={entry['depth']} via={entry['via_kind']} "
+            f"-> {entry['ancestor']}"
+        )
+
+
+@app.command("mutations")
+def mutations_cmd(
+    data_dir: Path,
+    ref: str = typer.Argument(
+        ..., help="Section: <table>/<drawer>#<section>"
+    ),
+) -> None:
+    """List the revision chain of a section.
+
+    Shows the section's own state / current_revision / supersedes labels.
+    Then for each label in supersedes, attempts to find a sibling section
+    in the same drawer matching ``<sid>:<label>`` or ``<sid>-<label>`` and
+    reports its state. AI uses this to read the evolution of a decision.
+
+    The DB does not interpret *why* the section evolved (D2) — only
+    collects revision labels and their on-disk presence.
+    """
+
+    t, d, sid = _parse_section_ref(ref)
+    self_target = f"{t}/{d}#{sid}"
+
+    with _open(data_dir) as db:
+        meta = db.get_section_meta(t, d, sid)
+        if meta is None:
+            typer.echo(f"# error: section not found: {ref}", err=True)
+            raise typer.Exit(2)
+
+        typer.echo(f"- section: {self_target}")
+        typer.echo(f"  state: {meta.get('state') or '(unset)'}")
+        typer.echo(f"  current_revision: {meta.get('current_revision') or '(unset)'}")
+        supersedes = list(meta.get("supersedes") or [])
+        if not supersedes:
+            typer.echo("  supersedes: (none)")
+            return
+        typer.echo(f"  supersedes: {supersedes}")
+
+        # Try to locate sibling revisions in the same drawer.
+        try:
+            sibling_ids = db.list_sections(t, d) or []
+        except Exception:  # noqa: BLE001
+            sibling_ids = []
+        sibling_set = {str(x) for x in sibling_ids}
+
+        for rev_label in supersedes:
+            candidates = [
+                f"{sid}:{rev_label}",
+                f"{sid}-{rev_label}",
+                f"{sid}_{rev_label}",
+                str(rev_label),
+            ]
+            found = next((c for c in candidates if c in sibling_set), None)
+            if found is None:
+                typer.echo(f"  - {rev_label}: (sibling not found)")
+                continue
+            try:
+                rev_meta = db.get_section_meta(t, d, found) or {}
+            except Exception:  # noqa: BLE001
+                rev_meta = {}
+            typer.echo(
+                f"  - {rev_label}: {t}/{d}#{found} "
+                f"state={rev_meta.get('state') or '(unset)'}"
+            )
 
 
 @app.command("recall")

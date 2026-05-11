@@ -1,6 +1,6 @@
 ---
 name: mddbai-recall
-description: The standard order to follow when looking up old records with mddbai. Auto-loaded when the user says "recall" / "find a memory" / "where is it" / "what we said before" / "previous decision" / "is there a record", or when mddbai recall / map results are weak. Do not bypass via Grep / whole-file Read / cat — follow the 6-step flow (Query Intent -> Memory Route Planning -> Parallel Navigation -> Evidence Reading -> Meaning Reconstruction -> User Output).
+description: The standard order to follow when looking up old records with mddbai. Auto-loaded when the user says "recall" / "find a memory" / "where is it" / "what we said before" / "previous decision" / "is there a record", or when mddbai recall / map results are weak. Do not bypass via Grep / whole-file Read / cat — follow the 6-step flow (Query Intent -> Memory Route Planning -> Parallel Navigation -> Evidence Reading -> Meaning Reconstruction -> User Output). Reasoning primitives (mddbai compare / conflict-check / provenance / mutations) are available at steps 4 and 5 — DB emits signals only, AI judges meaning.
 ---
 
 # Standard order for finding old records with mddbai (6 steps)
@@ -70,12 +70,17 @@ Parallel slots (AI strength):
 
            |
            v
-[4] Evidence Reading       (mddbai recall --strict or take, exact section only)
+[4] Evidence Reading       (mddbai recall --strict / take / compare)
     1 clear candidate -> mddbai recall .mddbai "<cue>" --strict
                          (only emits body when section is unique, rc 2 if ambiguous)
     N narrowed candidates -> mddbai take .mddbai <table> <drawer> <section>
                              multiple candidates -> *parallel* take (N calls in one message)
     larger section   -> --allow-large-dump (warning) or split
+
+    *Two candidates that look similar* (2026-05-09) ->
+       mddbai compare .mddbai <ref-A> <ref-B>
+       Returns common / a-only / b-only line sets — DB does NOT decide which
+       is right (D2). AI reads the marked sets and judges meaning.
 
            |
            v
@@ -84,6 +89,20 @@ Parallel slots (AI strength):
     Specify --include-superseded if you want to see old revisions.
     The recall stderr # conflict signal indicates active/deprecated conflict — AI judges.
     Also look at confidence / source / date metadata.
+
+    Reasoning primitives (2026-05-09) — call when the picture is unclear:
+      mddbai conflict-check .mddbai <ref>
+        -> 5 signals (contradicts / mixed-kind / state-mismatch /
+           stale-active / cycle-supersedes). rc 1 if any signal found.
+      mddbai provenance .mddbai <ref>
+        -> walk back outgoing edges (kind in supersedes / refines /
+           derived-from) to surface ancestors. Use when "why is this
+           the answer?" — trace the decision chain.
+      mddbai mutations .mddbai <ref>
+        -> revision chain (state + current_revision + supersedes labels +
+           sibling section presence). Use when "how did this evolve?".
+
+    DB only collects signals — meaning judgement is the AI's (D2).
 
            |
            v
@@ -107,9 +126,13 @@ Parallel slots (AI strength):
 | 3+ | `mddbai lexicon-look .mddbai "<cue>" --space both` | 0 | find cues from past user utterances / AI responses lexicons (helps semantic cue inference) |
 | 4 | `mddbai recall .mddbai "<cue>" --strict` | exact section | body only when section is unique, rc 2 if ambiguous |
 | 4 | `mddbai take .mddbai <t> <d> <s>` | exact section | direct call when section is decided |
+| 4 | `mddbai compare .mddbai <ref-A> <ref-B>` | 2 sections | common / a-only / b-only line sets, AI judges |
 | 4 | `--allow-large-dump` | large section | force when strict + section is large (warning) |
 | 5 | `--include-superseded` | exact section | also consider state=superseded/deprecated |
 | 5 | `# conflict: ...` (stderr) | — | auto-printed when active points to deprecated |
+| 5 | `mddbai conflict-check .mddbai <ref>` | 0 (signals) | 5 signals: contradicts / mixed-kind / state-mismatch / stale-active / cycle-supersedes |
+| 5 | `mddbai provenance .mddbai <ref>` | 0 (chain) | walk back supersedes / refines / derived-from edges |
+| 5 | `mddbai mutations .mddbai <ref>` | 0 (chain) | revision chain (state + current_revision + supersedes labels) |
 
 `--strict` can also be activated via env `MDDBAI_STRICT_RETRIEVAL=1`. `navigation_strict=True` in the config does the same.
 
@@ -140,10 +163,24 @@ Round 1 (in one message)
 Round 2 (in one message, once 1~3 candidates are decided)
   ├─ mddbai take .mddbai <t1> <d1> <s1>
   ├─ mddbai take .mddbai <t2> <d2> <s2>
-  └─ mddbai take .mddbai <t3> <d3> <s3>
+  ├─ mddbai take .mddbai <t3> <d3> <s3>
+  └─ (when 2 candidates look very similar)
+     mddbai compare .mddbai <t1>/<d1>#<s1> <t2>/<d2>#<s2>
+        ↓
+Round 3 (only if state / history / conflict matter — in one message)
+  ├─ mddbai conflict-check .mddbai <selected>     # if # conflict in stderr from R1
+  ├─ mddbai mutations .mddbai <selected>          # if user asks "what was before?"
+  └─ mddbai provenance .mddbai <selected>         # if user asks "why this decision?"
 ```
 
-Round 1 -> Round 2, done in two rounds. Longer than that = *signal that inference was weak* — go back to steps 1~2.
+Round 1 -> Round 2 (-> optional Round 3), done in 2~3 rounds. More than that = *signal that inference was weak* — go back to steps 1~2.
+
+**When to add Round 3** (decision tree):
+- ` # conflict: ` line in stderr from any earlier round  ->  `conflict-check`
+- user used words "previous" / "history" / "before" / "version"  ->  `mutations`
+- user used words "why" / "reason" / "based on what"  ->  `provenance`
+- two candidates with very close cue scores  ->  `compare` (in Round 2)
+- none of the above  ->  skip Round 3
 
 ---
 
@@ -268,6 +305,7 @@ take / recall results carry body + frontmatter together:
 
 - **chosen_because** — the previous AI's reasoning path -> no need to re-infer from scratch, inherit it
 - **related** — adjacent memories (Hebbian spreading) -> one more recall step possible
+- **relations** (2026-05-09) — typed adjacency: list of `{target, kind}` where kind ∈ {refines, supersedes, contradicts, implies, depends-on, derived-from}. Use the kind to *choose how to traverse* — e.g. follow `supersedes` only when looking for newer decisions; follow `refines` only when looking for detail
 - **state** — active / superseded / deprecated
 - **current_revision** — most recent revision id (e.g. r3)
 - **supersedes** — list of old revision ids (e.g. [r1, r2])
@@ -283,43 +321,96 @@ For old records that had 0 cues at write time — *the AI infers* and on the nex
 - [ ] [3] Did you get a 4-channel parallel dump with one mddbai map call? (no separate cues first)
 - [ ] [4] Did you take *only the exact section* with take / recall --strict?
 - [ ] If N candidates, did you call take *in parallel* (N calls in one message)?
+- [ ] [4+] If two candidates look very similar, did you call `mddbai compare A B` instead of eyeballing?
 - [ ] [5] Did you check state / superseded / conflict signals?
+- [ ] [5+] If conflict / mixed picture, did you reach for `conflict-check` / `provenance` / `mutations`?
 - [ ] No Grep / whole-file Read bypass?
 
-All 6 pass -> "not present" can be confirmed -> honest answer.
+All 8 pass -> "not present" can be confirmed -> honest answer.
 Any one X -> go back to that step.
 
 ---
 
-## 9. Case study (good flow)
+## 9. Case studies (good flow)
+
+### 9.1 Plain recall (no conflict)
 
 ```
-User: "what was the ceo decision from the Gangneung meeting we talked about"
+User: "what was the decision from <past meeting>"
 
-[1] Intent  fetch decision body (which decision was it)
-[2] Hypothesis  Gangneung = east coast workshop, decisions/ or sessions/, ceo attended
+[1] Intent     fetch decision body
+[2] Hypothesis decisions/ likely; <topic-keyword> = drawer slug
 
-[3] mddbai map .mddbai "gangneung meeting ceo decision"
-    -> routes: decisions/gangneung-meeting#ceo-q4 (3 signals)
-              sessions/2026-10/autumn-offsite (1 signal)
-    -> drawers: decisions/gangneung-meeting (sections: ceo-q4, summary)
-    -> related: ceo-q4 -> decisions/architecture#supply-chain
-    -> palace.purpose: ...
+[3] mddbai map .mddbai "<utterance keywords>"
+    -> 1 candidate drawer + 1 strong section signal -> straight to step 4
 
 [4] (parallel in one message)
-    ├─ mddbai recall .mddbai "gangneung meeting ceo decision" --strict
-    └─ mddbai take .mddbai decisions architecture supply-chain
-       (also take adjacent section by following the related edge)
+    ├─ mddbai recall .mddbai "<cue>" --strict
+    └─ mddbai take .mddbai <table> <related-drawer> <section>   # follow related edge
 
-[5] Result
-    selected: decisions/gangneung-meeting#ceo-q4 (state=active, r3)
-    chosen_because: "supply chain risk + marketing prep"
-    supersedes: [r1, r2]   # old decisions also exist (use --include-superseded if needed)
-    related: supply-chain (active)   # no conflict
+[5] Reconstruction
+    state: active, single revision -> no further primitive needed
 
 [6] Answer
-    "The CEO decision at the autumn 2026 Gangneung workshop = postpone the Q4 release.
-     Reason: supply chain risk + marketing prep. (Old r1/r2 are -> ...)"
+```
+
+### 9.2 Two close candidates -> compare
+
+```
+User: "<question whose answer could match either of two stored sections>"
+
+[3] map -> 2 strong candidates: decisions/<topic-a>#<sec> AND decisions/<topic-b>#<sec>
+
+[4] (parallel in one message)
+    ├─ mddbai take .mddbai <table> <topic-a> <sec>
+    ├─ mddbai take .mddbai <table> <topic-b> <sec>
+    └─ mddbai compare .mddbai <table>/<topic-a>#<sec> <table>/<topic-b>#<sec>
+       -> common / a-only / b-only line sets surface the difference for the AI
+
+[5] AI reads compare output -> judges which set matches the user's question
+[6] Answer + cite both refs, explain the distinction
+```
+
+### 9.3 Revision history needed -> mutations + provenance
+
+```
+User: "why did we end up with this decision? what were the previous versions?"
+
+[3] map -> 1 candidate: decisions/<topic>#<slug>:r3 (state=active, current_revision=r3)
+
+[4] mddbai take .mddbai <table> <drawer> <slug>:r3
+
+[5] Two reasoning primitives in parallel
+    ├─ mddbai mutations .mddbai <table>/<drawer>#<slug>:r3
+    │   -> reveals supersedes labels [r1, r2] + sibling sections + their states
+    ├─ mddbai provenance .mddbai <table>/<drawer>#<slug>:r3
+    │   -> walks back supersedes / refines / derived-from edges
+    │   -> surfaces ancestor decisions and the chain of refinement
+    └─ (then) take r1, r2 in parallel for the actual bodies
+
+[6] Answer = timeline (r1 -> r2 -> r3) + chosen_because per revision
+```
+
+### 9.4 Conflict detected -> conflict-check
+
+```
+User: "<question about a decision>"
+
+[3] map -> candidate has # conflict signal in stderr (active points at deprecated)
+
+[4] take the candidate body
+
+[5] Drill in
+    mddbai conflict-check .mddbai <table>/<drawer>#<section>
+    -> e.g. signals: [stale-active] claimed_by=<other ref>
+                     [state-mismatch] target=<old ref> target_state=superseded
+    -> AI judges: "this section forgot to flip to superseded.
+                   the *real* current decision lives at <other ref>"
+
+[6] Answer mentions both:
+    - what is currently labeled active (with the conflict warning)
+    - what AI judges to be the real current state, with the conflict-check signals as evidence
+    -> ask user whether to fix the on-disk state (consolidate skill territory)
 ```
 
 Bad flow in one line:

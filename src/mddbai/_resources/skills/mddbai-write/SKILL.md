@@ -1,6 +1,6 @@
 ---
 name: mddbai-write
-description: Enforce the mddbai write standard flow. Auto-loaded when the user says "record this" / "save" / "remember" / "note" / "log it" / "leave a record", or when storing decisions / insights / meeting outcomes / learnings. 6-step flow (Write Intent -> Placement -> Semantic Structuring -> Metadata Enrichment -> Relationship Linking -> Future Recall Check) + 4 cues per save (cue in the user's language / alias / because / related) + 1-letter lang hint (ko/en auto-detect; on recall the cold AI does cross-language inference) + state/current_revision/supersedes metadata + put-section --recall-check self-recall simulation. Bidirectional adjacency edges are confirmed by a separate mddbai link call (write itself has no --link option).
+description: Enforce the mddbai write standard flow. Auto-loaded when the user says "record this" / "save" / "remember" / "note" / "log it" / "leave a record", or when storing decisions / insights / meeting outcomes / learnings. 6-step flow (Write Intent -> Placement -> Semantic Structuring -> Metadata Enrichment -> Relationship Linking -> Future Recall Check) + 4 cues per save (cue in the user's language / alias / because / related) + 1-letter lang hint (ko/en auto-detect; on recall the cold AI does cross-language inference) + state/current_revision/supersedes metadata + put-section --recall-check self-recall simulation + mddbai conflict-check after revision writes. Bidirectional adjacency edges are confirmed by a separate mddbai link call (write itself has no --link option) — typed kinds (refines / supersedes / contradicts / implies / depends-on / derived-from) via mddbai link --kind.
 ---
 
 # mddbai write standard flow (6 steps)
@@ -90,27 +90,62 @@ Only triggered when a `.mddbai/` folder exists in the current project cwd.
 [5] Relationship Linking       (mddbai link, adjacency roads)
     Right after saving, add explicit roads to adjacent sections:
       mddbai link .mddbai \
-        decisions/gangneung#ceo-q4 \
-        decisions/architecture#supply-chain --bidir
+        <table>/<drawer-a>#<sec-a> \
+        <table>/<drawer-b>#<sec-b> --bidir
 
-    --bidir (default) — A <-> B bidirectional
+    --bidir (default) — A <-> B bidirectional (untyped, plain adjacency)
     --unidir          — A -> B only
 
+    --kind <6 kinds>  (2026-05-09)
+      Use when the AI wants to mark *what kind* of relation, not just
+      "these two are nearby". Writes to the typed `relations` field
+      instead of plain `related`. AI decides the kind, DB validates only.
+
+      | kind          | when to use                                    |
+      |---------------|------------------------------------------------|
+      | refines       | new section adds detail to an existing one     |
+      | supersedes    | new decision replaces an old one               |
+      | contradicts   | this section disagrees with target             |
+      | implies       | this section's conclusion follows from target  |
+      | depends-on    | this section is built on top of target         |
+      | derived-from  | this section is a summary / translation        |
+
+      Example (revision replacement):
+        mddbai link .mddbai \
+          decisions/v2#lock decisions/v1#lock --kind supersedes
+      Example (refinement):
+        mddbai link .mddbai \
+          decisions/migration-plan#step3 decisions/dogma#d2 \
+          --kind refines
+
     Multiple links should be *parallel* (N calls in one message).
+    Pick at most one kind per (A, B) pair — mixing refines + contradicts
+    on the same target trips conflict-check (mixed-kind signal).
 
            |
            v
-[6] Future Recall Check        (put-section --recall-check, self-recall simulation)
-    write does its own self-test — right after writing, navigate self-test
-    using the same cue. On weak/miss, prints a warning + reinforcement guidance to stderr.
+[6] Future Recall Check        (put-section --recall-check + conflict-check)
+    Two complementary self-tests right after writing:
 
-    mddbai write enables this by default. Disable with --skip-recall-check.
-    put-section also runs the same self-test when --recall-check is given.
+    (a) recall-check — self-recall simulation (default on, --skip-recall-check
+        to disable):
+        ok      — the written ref is recalled at rank 1 by the cue
+        weak    — appears among candidates but not rank 1 — reinforce alias/cue
+        miss    — 0 candidates — cue too weak, rewrite
 
-    Result classes:
-      ok      — the written ref is recalled at rank 1 by the cue
-      weak    — appears among candidates but not rank 1 — alias / cue needs reinforcement
-      miss    — 0 candidates — cue too weak, rewrite
+    (b) conflict-check (2026-05-09) — checks the written section for 5 signals:
+        contradicts        — explicit contradicts edge present
+        mixed-kind         — both refines and contradicts on same target
+        state-mismatch     — active section points at superseded target
+        stale-active       — another section says it supersedes this, but
+                             this is still active (forgot to flip state?)
+        cycle-supersedes   — supersedes chain loops back
+
+        Run after a revision write (--state / --supersedes / --kind supersedes):
+          mddbai conflict-check .mddbai <table>/<drawer>#<section>
+        rc 0 = clean. rc 1 = signals found, AI decides what to do.
+
+        DB does *not* judge the meaning — it surfaces signals only.
 ```
 
 ---
@@ -217,6 +252,8 @@ The old r1 / r2 remain as separate sections with `--state superseded`. Recall by
 
 If a section's related has a state conflict (active points to deprecated), recall stderr automatically prints `# conflict: ...` — semantic decisions are the AI's.
 
+For deeper checks after a revision write, call `mddbai conflict-check .mddbai <ref>` to surface 5 signals (contradicts / mixed-kind / state-mismatch / stale-active / cycle-supersedes). DB only emits signals; AI judges.
+
 ---
 
 ## 5. Parallel call steps (AI strength)
@@ -234,13 +271,18 @@ Round 1 (in one message, when writing several sections at once)
   └─ mddbai write .mddbai ... --new-section c --yes
         (3 sections saved in parallel — safe via per-drawer FileLock)
 
-Round 2 (in one message, links separately)
-  ├─ mddbai link .mddbai a#x b#y --bidir
-  ├─ mddbai link .mddbai a#x c#z --bidir
-  └─ mddbai link .mddbai b#y c#z --bidir
+Round 2 (in one message, links separately — pick a kind per pair)
+  ├─ mddbai link .mddbai a#x b#y --bidir                      # plain adjacency
+  ├─ mddbai link .mddbai a#x c#z --kind refines --unidir      # typed: a refines c
+  └─ mddbai link .mddbai b#y c#z --kind depends-on --unidir   # typed: b depends on c
+
+Round 3 (in one message, only after revision writes — conflict checks)
+  ├─ mddbai conflict-check .mddbai a#x
+  ├─ mddbai conflict-check .mddbai b#y
+  └─ mddbai conflict-check .mddbai c#z
 ```
 
-For multiple sections in the same drawer, 1 call (multiple `put-section` + 1 `flush`) is faster. For different drawers, parallel calls are OK.
+For multiple sections in the same drawer, 1 call (multiple `put-section` + 1 `flush`) is faster. For different drawers, parallel calls are OK. Round 3 is *only* for revisions — first-time writes do not need conflict-check.
 
 ---
 
@@ -292,37 +334,87 @@ This is the separation of *DB's job* and *AI's job*: the DB places a 1-letter la
 
 ## 6. Examples
 
-### Good example (steps 1~6 all present)
+### Good example A — first-time write (no prior revision)
 
 ```bash
-# Steps 1~2: AI in head — decision, add to decisions/gangneung-meeting drawer
-# Steps 3~4: write bundles them (one user language + lang auto-detect)
+# Steps 1~2: AI in head — decision, add to existing drawer (decisions/<topic>)
+# Steps 3~4: write bundles placement + semantic + metadata + recall-check
 mddbai write .mddbai \
   --kind decision \
-  --cue "gangneung autumn meeting ceo decision" \
-  --cue "q4 release postponement decision" \
-  --alias first-act --alias act1 --alias preparation \
-  --because "Decision to delay Q4 release — supply chain risk + marketing prep" \
+  --cue "<one cue in user's language>" \
+  --cue "<another cue in same language>" \
+  --alias <abbr> --alias <nickname> \
+  --because "<one line: why this matters>" \
   --state active \
-  --current-revision r1 \
-  --entity "ceo,marketing,supply-chain" \
-  --date 2026-10-15 \
-  --source "Gangneung workshop minutes" \
+  --entity "<comma-separated entities>" \
+  --date 2026-05-10 \
+  --source "<provenance>" \
   --confidence 0.9 \
   --memory-zone hot \
   --importance 8 \
-  --related decisions/architecture#supply-chain-risk \
+  --related <table>/<drawer>#<section> \
   --new-table decisions \
-  --new-drawer gangneung-meeting \
-  --new-section ceo-q4-decision \
+  --new-drawer <topic> \
+  --new-section <slug> \
   --body "## Current\n..." \
   --yes
-# Step 5: adjacency roads (Round 2 parallel)
+
+# Step 5: adjacency roads (Round 2, parallel — all in one message)
 mddbai link .mddbai \
-  decisions/gangneung-meeting#ceo-q4-decision \
-  sessions/2026-10/autumn-offsite#decisions --bidir
-# Step 6: write does recall-check on its own — check stderr result
+  decisions/<topic>#<slug> \
+  decisions/<related-topic>#<related-slug> --bidir
+mddbai link .mddbai \
+  decisions/<topic>#<slug> \
+  decisions/<dogma>#<rule> --kind depends-on --unidir   # typed: this depends on the rule
+
+# Step 6: recall-check is automatic. No conflict-check needed (no prior state).
 ```
+
+### Good example B — revision write (replaces an old decision)
+
+When the new save *replaces* an old revision, the typed link + state metadata + conflict-check chain all kick in.
+
+```bash
+# Steps 1~2: This is decision r3 replacing r1, r2 in the same drawer
+# Steps 3~4: state=active + supersedes labels + current_revision
+mddbai write .mddbai \
+  --kind decision \
+  --cue "<cue in user's language>" \
+  --because "<one line: why r3 replaces r1+r2>" \
+  --state active \
+  --current-revision r3 \
+  --supersedes r1 --supersedes r2 \
+  --new-table decisions \
+  --new-drawer <topic> \
+  --new-section <slug>:r3 \
+  --body "## Current\n..." \
+  --yes
+
+# Step 5: typed link back to the previous revision (REQUIRED on revision)
+mddbai link .mddbai \
+  decisions/<topic>#<slug>:r3 \
+  decisions/<topic>#<slug>:r2 --kind supersedes --unidir
+mddbai link .mddbai \
+  decisions/<topic>#<slug>:r3 \
+  decisions/<topic>#<slug>:r1 --kind supersedes --unidir
+
+# Also flip old states (REQUIRED to avoid stale-active signal)
+mddbai write .mddbai --ref decisions/<topic>#<slug>:r2 --state superseded --yes
+mddbai write .mddbai --ref decisions/<topic>#<slug>:r1 --state superseded --yes
+
+# Step 6: recall-check (automatic) + conflict-check (mandatory after revision)
+mddbai conflict-check .mddbai decisions/<topic>#<slug>:r3
+# rc 0 = clean. rc 1 = AI reads signals (contradicts / mixed-kind /
+#                     state-mismatch / stale-active / cycle-supersedes)
+#                     and decides what to fix.
+```
+
+> **Revision write checklist** (each one is a real conflict-check signal if missed):
+>
+> - typed `supersedes` link back to old revisions (otherwise: no provenance chain)
+> - flip old revisions' `--state superseded` (otherwise: `stale-active` signal)
+> - typed kind on the link must be `supersedes`, not plain `--related` (otherwise: `mutations` cannot find the chain)
+> - exactly one kind per (A, B) pair (mixing refines + contradicts on same target -> `mixed-kind` signal)
 
 ### Bad example (poor traces)
 
@@ -351,10 +443,12 @@ Add `--yes` only when all of the following pass:
 - [ ] [4+] When adding a revision, did you specify state / current_revision / supersedes?
 - [ ] [4+] Are extra metadata (entity / date / source / confidence) included?
 - [ ] [5] Did you include adjacent section refs? (write `--related` + if needed a separate `mddbai link --bidir` call)
+- [ ] [5+] If the link is *typed*, did you pick exactly one kind from the 6 (refines / supersedes / contradicts / implies / depends-on / derived-from)?
 - [ ] [6] Is the recall-check result ok? (reinforce on weak/miss)
+- [ ] [6+] After a revision write (--state / --supersedes / --kind supersedes), did you run `mddbai conflict-check` and confirm rc 0?
 - [ ] Did you specify `--ref` or `--new-*`? (no auto-recommend fallback)
 
-All 9 pass -> save OK.
+All 11 pass -> save OK.
 Any one X -> traces are poor, redo the entry.
 
 ---
